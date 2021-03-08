@@ -20,6 +20,7 @@ from maro.utils.exit_code import NON_RESTART_EXIT_CODE
 from ..message import Message
 from ..utils import default_parameters
 from .abs_driver import AbsDriver
+from .driver_type import ComponentAttr
 
 PROTOCOL = default_parameters.driver.zmq.protocol
 SEND_TIMEOUT = default_parameters.driver.zmq.send_timeout
@@ -42,12 +43,16 @@ class ZmqDriver(AbsDriver):
     def __init__(
         self,
         component_type: str,
+        subordinates: list,
+        is_subordinate: bool = False,
         protocol: str = PROTOCOL,
         send_timeout: int = SEND_TIMEOUT,
         receive_timeout: int = RECEIVE_TIMEOUT,
         logger=DummyLogger()
     ):
         self._component_type = component_type
+        self._subordinates = subordinates
+        self._is_subordinate = is_subordinate
         self._protocol = protocol
         self._send_timeout = send_timeout
         self._receive_timeout = receive_timeout
@@ -56,7 +61,14 @@ class ZmqDriver(AbsDriver):
         self._disconnected_peer_name_list = []
         self._logger = logger
 
-        self._setup_sockets()
+        self._address = {}
+        # Dict about zmq.PUSH sockets, fulfills in self.connect.
+        self._unicast_sender_dict = {}
+        # Initial poller for multi-receiver
+        self._poller = zmq.Poller()
+
+        if not is_subordinate:
+            self._setup_sockets()
 
     def _setup_sockets(self):
         """Setup three kinds of sockets, and one poller.
@@ -70,9 +82,6 @@ class ZmqDriver(AbsDriver):
         self._unicast_receiver = self._zmq_context.socket(zmq.PULL)
         unicast_receiver_port = self._unicast_receiver.bind_to_random_port(f"{self._protocol}://*")
         self._logger.info(f"Receive message via unicasting at {self._ip_address}:{unicast_receiver_port}.")
-
-        # Dict about zmq.PUSH sockets, fulfills in self.connect.
-        self._unicast_sender_dict = {}
 
         self._broadcast_sender = self._zmq_context.socket(zmq.PUB)
         self._broadcast_sender.setsockopt(zmq.SNDTIMEO, self._send_timeout)
@@ -88,7 +97,15 @@ class ZmqDriver(AbsDriver):
             zmq.SUB: f"{self._protocol}://{self._ip_address}:{broadcast_receiver_port}"
         }
 
-        self._poller = zmq.Poller()
+        # Build Special zmq.PUSH for its subordinate only for principal component
+        if self._subordinates:
+            self._address[zmq.PUSH] = {}
+            for subordinate in self._subordinates:
+                self._unicast_sender_dict[subordinate] = self._zmq_context.socket(zmq.PUSH)
+                dispatch_sender_port = self._unicast_sender_dict[subordinate].bind_to_random_port(f"{self._protocol}://*")
+
+                self._address[zmq.PUSH][subordinate] = f"{self._protocol}://{self._ip_address}:{dispatch_sender_port}"
+
         self._poller.register(self._unicast_receiver, zmq.POLLIN)
         self._poller.register(self._broadcast_receiver, zmq.POLLIN)
 
@@ -117,6 +134,9 @@ class ZmqDriver(AbsDriver):
         """
         for peer_name, address_dict in peers_address_dict.items():
             for socket_type, address in address_dict.items():
+                if address in self._address.values():
+                    break
+
                 try:
                     if int(socket_type) == zmq.PULL:
                         self._unicast_sender_dict[peer_name] = self._zmq_context.socket(zmq.PUSH)
@@ -124,8 +144,14 @@ class ZmqDriver(AbsDriver):
                         self._unicast_sender_dict[peer_name].connect(address)
                         self._logger.info(f"Connects to {peer_name} via unicasting.")
                     elif int(socket_type) == zmq.SUB:
-                        self._broadcast_sender.connect(address)
-                        self._logger.info(f"Connects to {peer_name} via broadcasting.")
+                        if not self._is_subordinate:
+                            self._broadcast_sender.connect(address)
+                            self._logger.info(f"Connects to {peer_name} via broadcasting.")
+                    elif int(socket_type) == zmq.PUSH and self._is_subordinate:
+                        self._unicast_receiver = self._zmq_context.socket(zmq.PULL)
+                        self._unicast_receiver.setsockopt(zmq.RCVTIMEO, self._receive_timeout)
+                        self._unicast_receiver.connect(address[self._component_type])
+                        self._poller.register(self._unicast_receiver, zmq.POLLIN)
                     else:
                         raise SocketTypeError(f"Unrecognized socket type {socket_type}.")
                 except Exception as e:
@@ -229,8 +255,9 @@ class ZmqDriver(AbsDriver):
         self._zmq_context.setsockopt(zmq.LINGER, 0)
 
         # Close all sockets
-        self._broadcast_receiver.close()
-        self._broadcast_sender.close()
+        if not self._is_subordinate:
+            self._broadcast_receiver.close()
+            self._broadcast_sender.close()
         self._unicast_receiver.close()
         for unicast_sender in self._unicast_sender_dict.values():
             unicast_sender.close()

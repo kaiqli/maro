@@ -20,7 +20,7 @@ from maro.utils import DummyLogger, InternalLogger
 from maro.utils.exception.communication_exception import InformationUncompletedError, PeersMissError, PendingToSend
 from maro.utils.exit_code import KILL_ALL_EXIT_CODE, NON_RESTART_EXIT_CODE
 
-from .driver import DriverType, ZmqDriver
+from .driver import ComponentAttr, DriverType, ZmqDriver
 from .message import Message, NotificationSessionStage, SessionMessage, SessionType, TaskSessionStage
 from .utils import default_parameters
 
@@ -72,7 +72,9 @@ class Proxy:
         self,
         group_name: str,
         component_type: str,
-        expected_peers: dict,
+        expected_peers: dict = None,
+        subordinates: list = None,
+        is_subordinate: bool = False,
         driver_type: DriverType = DriverType.ZMQ,
         driver_parameters: dict = None,
         redis_address: Tuple = (HOST, PORT),
@@ -88,8 +90,12 @@ class Proxy:
         is_remove_failed_container: bool = IS_REMOVE_FAILED_CONTAINER,
         max_rejoin_times: int = MAX_REJOIN_TIMES
     ):
+        if is_subordinate:
+            assert(subordinates == None)
+
         self._group_name = group_name
         self._component_type = component_type
+        self._is_subordinate = is_subordinate
         self._redis_hash_name = f"{self._group_name}:{self._component_type}"
         if "COMPONENT_NAME" in os.environ:
             self._name = os.getenv("COMPONENT_NAME")
@@ -106,8 +112,17 @@ class Proxy:
         # Initialize the driver.
         if driver_type == DriverType.ZMQ:
             self._driver = ZmqDriver(
-                component_type=self._component_type, **driver_parameters, logger=self._logger
-            ) if driver_parameters else ZmqDriver(component_type=self._component_type, logger=self._logger)
+                component_type=self._component_type,
+                subordinates=subordinates,
+                is_subordinate=is_subordinate,
+                **driver_parameters,
+                logger=self._logger
+            ) if driver_parameters else ZmqDriver(
+                component_type=self._component_type,
+                subordinates=subordinates,
+                is_subordinate=is_subordinate,
+                logger=self._logger
+            )
         else:
             self._logger.error(f"Unsupported driver type {driver_type}, please use DriverType class.")
             sys.exit(NON_RESTART_EXIT_CODE)
@@ -334,7 +349,7 @@ class Proxy:
             return received_messages
 
         # Wait for incoming messages.
-        for msg in self._driver.receive(is_continuous=True, timeout=timeout):
+        for msg in self.receive(is_continuous=True, timeout=timeout):
             if not msg:
                 return received_messages
 
@@ -607,6 +622,15 @@ class Proxy:
         """
         message.forward(destination=destination, tag=tag, payload=payload)
         return self.isend(message)
+
+    def dispatch(
+        self,
+        message: Union[SessionMessage, Message]
+    ):
+        assert(not self._is_subordinate)
+
+        self._driver.send(message)
+        return message.session_id
 
     def _check_peers_update(self):
         """Compare the peers' information on local with the peers' information on Redis.
